@@ -73,14 +73,30 @@ unwrapped.overrideAttrs (old: {
         "vcs_tag = '${old.version}'"
   '';
 
-  # Ship ONLY the compositor, renamed. Everything else nixpkgs installs (gamescopectl,
-  # gamescopereaper, gamescopestream, the WSI layer, .desktop files) belongs to the real gamescope
-  # package — duplicating it here would put two of each on PATH. The host only execs the
-  # compositor.
+  # Expose the compositor under our own name, ADDITIVELY — a symlink beside nixpkgs' own layout
+  # rather than a rename plus a sweep of everything else.
+  #
+  # The sweep this replaces (`find $out ! -name bin -exec rm -rf {} +`, `find $out/bin ! -name
+  # gamescope -delete`, `mv gamescope punktfunk-gamescope`) assumed a plain meson install, the way
+  # the Arch PKGBUILD gets one. Against nixpkgs' recipe it breaks three ways, all caused by what
+  # nixpkgs' OWN postInstall does immediately before ours runs:
+  #
+  #   1. It copies the ReShade shaders out of the store (`cp -r ${frogShaders}/* …`), which
+  #      preserves mode 555 on the directories — so the `rm -rf` fails with a pile of
+  #      `Permission denied` and takes the build down with it.
+  #   2. It runs `wrapProgram $out/bin/gamescope`, leaving the real ELF at `.gamescope-wrapped`;
+  #      the `-delete` sweep removes exactly that, so the renamed wrapper would exec a file that
+  #      no longer exists (and `installCheckPhase` below would catch it).
+  #   3. It bakes an absolute `$out/bin/gamescopereaper` into the binary (`substituteInPlace
+  #      src/Utils/Process.cpp --subst-var-by "gamescopereaper" …`). The reaper is what launches
+  #      the nested `-- <app>`, i.e. the host's bare-spawn path — deleting it produces a package
+  #      that builds fine and fails at stream time.
+  #
+  # Keeping nixpkgs' output intact costs nothing here: this package lands on the punktfunk-host
+  # unit's PATH, not a user profile, and `gamescope_bin()` looks for `punktfunk-gamescope` first,
+  # so the plain `gamescope` name sitting next to it is never picked by accident.
   postInstall = (old.postInstall or "") + ''
-    find $out -mindepth 1 -maxdepth 1 ! -name bin -exec rm -rf {} +
-    find $out/bin -mindepth 1 ! -name gamescope -delete
-    mv $out/bin/gamescope $out/bin/punktfunk-gamescope
+    ln -s gamescope $out/bin/punktfunk-gamescope
   '';
 
   # `gamescope --version` exits non-zero on some builds; the grep is the real assertion.

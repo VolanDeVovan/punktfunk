@@ -1025,6 +1025,11 @@ impl NvencD3d11Encoder {
                 bit_depth: self.bit_depth,
                 av1_input_depth_minus8: if ten_bit_in { 2 } else { 0 },
                 hdr: self.hdr,
+                // A packed-RGB surface is precisely the case where NVENC, not one of our shaders,
+                // performs the RGB→YUV conversion — the same `rgb_input` that decides full-chroma
+                // above. The P010 path (`HdrP010Converter`) lands here as false, since that shader
+                // already converted against a matrix we picked.
+                nvenc_internal_csc: rgb_input,
                 rfi_supported: self.rfi_supported,
                 // Latched by `init_session` from the negotiated ceiling (P2f) — a later
                 // reconfigure re-presents the same slicing.

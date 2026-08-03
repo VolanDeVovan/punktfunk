@@ -1216,6 +1216,17 @@ impl NvencCudaEncoder {
             self.buffer_fmt,
             nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
         );
+        // Packed RGB in means NVENC does the RGB→YUV conversion itself, so the colour signalling
+        // has to describe ITS matrix, not the one a shader of ours would have used. `buffer_format`
+        // above is the only place that decides this, and it is exactly the HDR capture path
+        // (`ARGB10`) plus the device-copy fallback (`ARGB`).
+        let packed_rgb_input = matches!(
+            self.buffer_fmt,
+            nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+                | nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR
+                | nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB10
+                | nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10
+        );
         apply_low_latency_config(
             &mut cfg,
             LowLatencyConfig {
@@ -1232,6 +1243,7 @@ impl NvencCudaEncoder {
                     0
                 },
                 hdr: self.hdr,
+                nvenc_internal_csc: packed_rgb_input,
                 rfi_supported: self.rfi_supported,
                 slices: self.slices,
             },

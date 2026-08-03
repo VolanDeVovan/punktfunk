@@ -318,9 +318,80 @@ mod tests {
             bit_depth,
             av1_input_depth_minus8: 0,
             hdr: false,
+            // These cases assert the chroma/bit-depth arms, which the CSC origin does not reach;
+            // `full_chroma_input: true` above is the Windows packed-RGB shape, so match it.
+            nvenc_internal_csc: true,
             rfi_supported: false,
             slices: 0,
         }
+    }
+
+    /// The whole point of this pass is that it changes nothing until an operator asks it to. With
+    /// no env set, an HDR session must still declare exactly what it declared before: BT.2020
+    /// primaries, PQ transfer, BT.2020 NCL matrix, limited swing.
+    #[test]
+    fn hdr_colour_signalling_is_unchanged_without_an_override() {
+        // SAFETY: as in the sibling tests — `apply_low_latency_config` only writes into the
+        // caller's config and makes no driver calls.
+        let cfg = unsafe {
+            let mut cfg = nv::NV_ENC_CONFIG::default();
+            let mut c = low_latency_cfg(Codec::H265, false, 10);
+            c.hdr = true;
+            apply_low_latency_config(&mut cfg, c);
+            cfg
+        };
+        // SAFETY: an H265 session's union arm is `hevcConfig`.
+        unsafe {
+            let vui = cfg.encodeCodecConfig.hevcConfig.hevcVUIParameters;
+            assert_eq!(
+                vui.colourPrimaries,
+                nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT2020
+            );
+            assert_eq!(
+                vui.transferCharacteristics,
+                nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084
+            );
+            assert_eq!(
+                vui.colourMatrix,
+                nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL
+            );
+            assert_eq!(vui.videoFullRangeFlag, 0, "swing must stay limited by default");
+        }
+    }
+
+    #[test]
+    fn vui_matrix_names_map_to_their_cicp_points() {
+        use nv::NV_ENC_VUI_MATRIX_COEFFS as M;
+        assert_eq!(
+            parse_vui_matrix("bt709"),
+            Some(M::NV_ENC_VUI_MATRIX_COEFFS_BT709)
+        );
+        assert_eq!(
+            parse_vui_matrix(" BT2020NCL "),
+            Some(M::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL)
+        );
+        // The 601 pair is one matrix under two names; both spellings have to land on it, since
+        // "NVENC used 601" is the hypothesis this knob exists to test.
+        assert_eq!(
+            parse_vui_matrix("bt601"),
+            Some(M::NV_ENC_VUI_MATRIX_COEFFS_BT470BG)
+        );
+        assert_eq!(
+            parse_vui_matrix("smpte170m"),
+            Some(M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M)
+        );
+        // Garbage must leave the derived value alone rather than resolve to some default.
+        assert_eq!(parse_vui_matrix("bt2021"), None);
+        assert_eq!(parse_vui_matrix(""), None);
+    }
+
+    #[test]
+    fn vui_full_range_takes_both_spellings_and_rejects_the_rest() {
+        assert_eq!(parse_vui_full_range("1"), Some(1));
+        assert_eq!(parse_vui_full_range("full"), Some(1));
+        assert_eq!(parse_vui_full_range("0"), Some(0));
+        assert_eq!(parse_vui_full_range(" Limited "), Some(0));
+        assert_eq!(parse_vui_full_range("yes"), None);
     }
 
     #[test]
@@ -592,6 +663,72 @@ mod range_policy_tests {
     }
 }
 
+/// `PUNKTFUNK_VUI_MATRIX` — force the matrix-coefficients CICP code point the stream declares.
+/// Unset (the default) keeps the derived value, so this is inert on every host that does not set it.
+///
+/// It exists because the colour signalling must describe whoever performed the RGB→YUV conversion,
+/// and on a packed-RGB input that is NVENC's own fixed-function CSC — whose matrix the SDK does not
+/// document and, as far as we can tell, does not take from these very fields. Naming the observed
+/// matrix here is how that gets established against a real decoder rather than assumed.
+///
+/// Accepts the CICP names (`bt709`, `bt2020ncl`, `bt470bg`/`bt601`, `smpte170m`, …); an
+/// unrecognised value warns and is ignored rather than silently selecting something.
+fn vui_matrix_override() -> Option<nv::NV_ENC_VUI_MATRIX_COEFFS> {
+    parse_vui_matrix(&std::env::var("PUNKTFUNK_VUI_MATRIX").ok()?)
+}
+
+/// The name→CICP mapping behind [`vui_matrix_override`], split out for testability: env vars are
+/// process-global, so a test that set one would race the parallel suite.
+fn parse_vui_matrix(raw: &str) -> Option<nv::NV_ENC_VUI_MATRIX_COEFFS> {
+    use nv::NV_ENC_VUI_MATRIX_COEFFS as M;
+    Some(match raw.trim().to_ascii_lowercase().as_str() {
+        "rgb" => M::NV_ENC_VUI_MATRIX_COEFFS_RGB,
+        "bt709" | "709" => M::NV_ENC_VUI_MATRIX_COEFFS_BT709,
+        "unspecified" => M::NV_ENC_VUI_MATRIX_COEFFS_UNSPECIFIED,
+        "fcc" => M::NV_ENC_VUI_MATRIX_COEFFS_FCC,
+        "bt470bg" | "bt601" | "601" => M::NV_ENC_VUI_MATRIX_COEFFS_BT470BG,
+        "smpte170m" | "170m" => M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M,
+        "smpte240m" | "240m" => M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE240M,
+        "ycgco" => M::NV_ENC_VUI_MATRIX_COEFFS_YCGCO,
+        "bt2020ncl" | "bt2020_ncl" | "2020ncl" => M::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL,
+        "bt2020cl" | "bt2020_cl" | "2020cl" => M::NV_ENC_VUI_MATRIX_COEFFS_BT2020_CL,
+        "smpte2085" => M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE2085,
+        other => {
+            tracing::warn!(
+                value = other,
+                "PUNKTFUNK_VUI_MATRIX: unrecognised matrix name — leaving the derived value"
+            );
+            return None;
+        }
+    })
+}
+
+/// `PUNKTFUNK_VUI_FULL_RANGE` — force the declared swing (`1` full/PC, `0` limited/studio). Unset
+/// keeps the derived value (limited).
+///
+/// Same reasoning as [`vui_matrix_override`], for the other half of the description: a CSC we did
+/// not perform also picked a swing we did not choose, and a stream that computes full but declares
+/// limited gets expanded a second time by the decoder.
+fn vui_full_range_override() -> Option<u32> {
+    parse_vui_full_range(&std::env::var("PUNKTFUNK_VUI_FULL_RANGE").ok()?)
+}
+
+/// The value→flag mapping behind [`vui_full_range_override`]; split out for the same reason as
+/// [`parse_vui_matrix`].
+fn parse_vui_full_range(raw: &str) -> Option<u32> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "full" => Some(1),
+        "0" | "limited" | "studio" => Some(0),
+        other => {
+            tracing::warn!(
+                value = other,
+                "PUNKTFUNK_VUI_FULL_RANGE: expected 0/1 (limited/full) — leaving the derived value"
+            );
+            None
+        }
+    }
+}
+
 /// The per-session knobs both direct-NVENC backends feed [`apply_low_latency_config`]. `Copy` so the
 /// backend fills it from `self` at the call. The two input-format fields bridge the only real
 /// divergence between the CUDA and D3D11 paths (which surface formats can carry full chroma / 10-bit
@@ -615,6 +752,15 @@ pub(super) struct LowLatencyConfig {
     /// today, so 0; Windows derives it from the surface format). `u32` to match the SDK setter.
     pub av1_input_depth_minus8: u32,
     pub hdr: bool,
+    /// The surface handed to NVENC is packed RGB, so NVENC's own fixed-function CSC produces the
+    /// YUV that gets encoded. False when the surface already carries YUV (NV12/YUV444/P010) that
+    /// one of our shaders converted against a matrix we chose.
+    ///
+    /// This decides WHOSE matrix the colour signalling has to describe, which is not the same
+    /// question as [`hdr`](Self::hdr). Getting it wrong does not fail anything loudly — the stream
+    /// simply carries YUV computed one way and labelled another, and every decoder inverts it with
+    /// the label.
+    pub nvenc_internal_csc: bool,
     /// This GPU supports reference-frame invalidation (a deeper DPB for graceful loss recovery).
     pub rfi_supported: bool,
     /// Resolved per-frame slice count ([`resolve_slices`] — env override, else the backend
@@ -786,6 +932,12 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
     // "unspecified" default is 601 (Moonlight/third-party/Android-vendor at sub-HD) otherwise
     // mis-renders. HEVC/H.264 carry it in the VUI; AV1 has no VUI, so the same CICP code points go in
     // the sequence-header colour config.
+    //
+    // NOTE the premise of that first sentence: it holds only when a shader of ours did the CSC.
+    // On a packed-RGB input (`nvenc_internal_csc`) NVENC converts internally, against a matrix and
+    // a swing the SDK neither documents nor derives from these VUI fields — so the values below
+    // may DESCRIBE something nobody computed. The env overrides exist to pin the observed
+    // behaviour on a real decoder; unset, they change nothing.
     {
         let (prim, trc, mat) = if c.hdr {
             (
@@ -800,11 +952,26 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
                 nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709,
             )
         };
+        let mat = vui_matrix_override().unwrap_or(mat);
+        let full_range = vui_full_range_override().unwrap_or(0);
+        // One line naming exactly what the sequence header will claim, next to who actually did the
+        // conversion. Reading it beside a picture on the glass is what turns "the colours look
+        // wrong" into a specific mismatch.
+        tracing::info!(
+            hdr = c.hdr,
+            nvenc_internal_csc = c.nvenc_internal_csc,
+            primaries = ?prim,
+            transfer = ?trc,
+            matrix = ?mat,
+            full_range,
+            codec = ?c.codec,
+            "colour signalling written into the stream"
+        );
         match c.codec {
             Codec::H265 => {
                 let vui = &mut cfg.encodeCodecConfig.hevcConfig.hevcVUIParameters;
                 vui.videoSignalTypePresentFlag = 1;
-                vui.videoFullRangeFlag = 0;
+                vui.videoFullRangeFlag = full_range;
                 vui.colourDescriptionPresentFlag = 1;
                 vui.colourPrimaries = prim;
                 vui.transferCharacteristics = trc;
@@ -813,7 +980,7 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
             Codec::H264 => {
                 let vui = &mut cfg.encodeCodecConfig.h264Config.h264VUIParameters;
                 vui.videoSignalTypePresentFlag = 1;
-                vui.videoFullRangeFlag = 0;
+                vui.videoFullRangeFlag = full_range;
                 vui.colourDescriptionPresentFlag = 1;
                 vui.colourPrimaries = prim;
                 vui.transferCharacteristics = trc;
@@ -824,7 +991,7 @@ pub(super) unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: Lo
                 av1.colorPrimaries = prim;
                 av1.transferCharacteristics = trc;
                 av1.matrixCoefficients = mat;
-                av1.colorRange = 0; // studio/limited swing
+                av1.colorRange = full_range; // 0 = studio/limited swing
             }
             Codec::PyroWave => unreachable!("PyroWave never opens the direct-NVENC backend"),
         }

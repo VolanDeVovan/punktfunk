@@ -57,6 +57,54 @@ pub fn env_on(name: &str) -> Option<bool> {
     })
 }
 
+/// `PUNKTFUNK_VUI_MATRIX` — the matrix-coefficients CICP code point a session declares, as a raw
+/// H.273 value. `None` (unset, or a name we do not recognise) keeps whatever the caller derived.
+///
+/// Lives here, in a crate BOTH the encoder and the host handshake depend on, because a session
+/// describes its colour twice — once in the bitstream VUI, once in the punktfunk/1 `ColorInfo` —
+/// and the two describe the same conversion. Clients read one or the other: the webOS/LG client
+/// hands `ColorInfo.matrix` straight to `NDL_DirectVideoSetHDRInfo` and never parses the VUI. A
+/// knob that moved only one of them would fix the picture on some clients and not others.
+pub fn vui_matrix_override() -> Option<u8> {
+    parse_cicp_matrix(&std::env::var("PUNKTFUNK_VUI_MATRIX").ok()?)
+}
+
+/// The name→H.273 code point mapping behind [`vui_matrix_override`], split out for testability:
+/// env vars are process-global, so a test that set one would race the parallel suite.
+pub fn parse_cicp_matrix(raw: &str) -> Option<u8> {
+    Some(match raw.trim().to_ascii_lowercase().as_str() {
+        "rgb" | "gbr" => 0,
+        "bt709" | "709" => 1,
+        "unspecified" => 2,
+        "fcc" => 4,
+        // The 601 pair: one matrix (Kr .299 / Kb .114) under two code points.
+        "bt470bg" | "bt601" | "601" => 5,
+        "smpte170m" | "170m" => 6,
+        "smpte240m" | "240m" => 7,
+        "ycgco" => 8,
+        "bt2020ncl" | "bt2020_ncl" | "2020ncl" => 9,
+        "bt2020cl" | "bt2020_cl" | "2020cl" => 10,
+        "smpte2085" => 11,
+        _ => return None,
+    })
+}
+
+/// `PUNKTFUNK_VUI_FULL_RANGE` — the declared swing (`1` full/PC, `0` limited/studio). `None` keeps
+/// the caller's derived value. Companion to [`vui_matrix_override`], applied in the same two
+/// places for the same reason.
+pub fn vui_full_range_override() -> Option<u8> {
+    match std::env::var("PUNKTFUNK_VUI_FULL_RANGE")
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "full" => Some(1),
+        "0" | "limited" | "studio" => Some(0),
+        _ => None,
+    }
+}
+
 /// Resolved host configuration. Holds the genuinely-constant operator/dispatch knobs (see module docs for
 /// what is deliberately excluded). Fields read on only one platform are kept alive cross-platform by the
 /// derived `Debug` impl, so the parser can stay a single platform-neutral function.

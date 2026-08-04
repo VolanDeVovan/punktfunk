@@ -359,39 +359,33 @@ mod tests {
         }
     }
 
+    /// The knob is parsed once, in `pf-host-config`, and translated here. The translation must
+    /// agree with the code point the handshake will put in `ColorInfo.matrix` for the same input —
+    /// a stream that describes itself two different ways is the bug this whole path is about.
     #[test]
-    fn vui_matrix_names_map_to_their_cicp_points() {
+    fn cicp_points_translate_to_the_matching_nvenc_variant() {
         use nv::NV_ENC_VUI_MATRIX_COEFFS as M;
-        assert_eq!(
-            parse_vui_matrix("bt709"),
-            Some(M::NV_ENC_VUI_MATRIX_COEFFS_BT709)
-        );
-        assert_eq!(
-            parse_vui_matrix(" BT2020NCL "),
-            Some(M::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL)
-        );
-        // The 601 pair is one matrix under two names; both spellings have to land on it, since
-        // "NVENC used 601" is the hypothesis this knob exists to test.
-        assert_eq!(
-            parse_vui_matrix("bt601"),
-            Some(M::NV_ENC_VUI_MATRIX_COEFFS_BT470BG)
-        );
-        assert_eq!(
-            parse_vui_matrix("smpte170m"),
-            Some(M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M)
-        );
-        // Garbage must leave the derived value alone rather than resolve to some default.
-        assert_eq!(parse_vui_matrix("bt2021"), None);
-        assert_eq!(parse_vui_matrix(""), None);
-    }
-
-    #[test]
-    fn vui_full_range_takes_both_spellings_and_rejects_the_rest() {
-        assert_eq!(parse_vui_full_range("1"), Some(1));
-        assert_eq!(parse_vui_full_range("full"), Some(1));
-        assert_eq!(parse_vui_full_range("0"), Some(0));
-        assert_eq!(parse_vui_full_range(" Limited "), Some(0));
-        assert_eq!(parse_vui_full_range("yes"), None);
+        for (name, cicp, variant) in [
+            ("bt709", 1u8, M::NV_ENC_VUI_MATRIX_COEFFS_BT709),
+            ("bt601", 5, M::NV_ENC_VUI_MATRIX_COEFFS_BT470BG),
+            ("smpte170m", 6, M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M),
+            ("bt2020ncl", 9, M::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL),
+        ] {
+            assert_eq!(
+                pf_host_config::parse_cicp_matrix(name),
+                Some(cicp),
+                "{name} must parse to CICP {cicp}"
+            );
+            assert_eq!(
+                cicp_to_nvenc_matrix(cicp),
+                Some(variant),
+                "CICP {cicp} must reach the matching NVENC variant"
+            );
+        }
+        // Garbage leaves the derived value alone rather than resolving to some default.
+        assert_eq!(pf_host_config::parse_cicp_matrix("bt2021"), None);
+        assert_eq!(pf_host_config::parse_cicp_matrix(""), None);
+        assert_eq!(cicp_to_nvenc_matrix(3), None); // H.273 "reserved"
     }
 
     #[test]
@@ -674,29 +668,30 @@ mod range_policy_tests {
 /// Accepts the CICP names (`bt709`, `bt2020ncl`, `bt470bg`/`bt601`, `smpte170m`, …); an
 /// unrecognised value warns and is ignored rather than silently selecting something.
 fn vui_matrix_override() -> Option<nv::NV_ENC_VUI_MATRIX_COEFFS> {
-    parse_vui_matrix(&std::env::var("PUNKTFUNK_VUI_MATRIX").ok()?)
+    cicp_to_nvenc_matrix(pf_host_config::vui_matrix_override()?)
 }
 
-/// The name→CICP mapping behind [`vui_matrix_override`], split out for testability: env vars are
-/// process-global, so a test that set one would race the parallel suite.
-fn parse_vui_matrix(raw: &str) -> Option<nv::NV_ENC_VUI_MATRIX_COEFFS> {
+/// H.273 code point → the NVENC enum. The parsing itself lives in `pf-host-config` so the
+/// handshake's `ColorInfo` resolves the SAME knob to the SAME value; this only translates.
+/// A code point NVENC has no variant for keeps the derived value rather than guessing.
+fn cicp_to_nvenc_matrix(cicp: u8) -> Option<nv::NV_ENC_VUI_MATRIX_COEFFS> {
     use nv::NV_ENC_VUI_MATRIX_COEFFS as M;
-    Some(match raw.trim().to_ascii_lowercase().as_str() {
-        "rgb" => M::NV_ENC_VUI_MATRIX_COEFFS_RGB,
-        "bt709" | "709" => M::NV_ENC_VUI_MATRIX_COEFFS_BT709,
-        "unspecified" => M::NV_ENC_VUI_MATRIX_COEFFS_UNSPECIFIED,
-        "fcc" => M::NV_ENC_VUI_MATRIX_COEFFS_FCC,
-        "bt470bg" | "bt601" | "601" => M::NV_ENC_VUI_MATRIX_COEFFS_BT470BG,
-        "smpte170m" | "170m" => M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M,
-        "smpte240m" | "240m" => M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE240M,
-        "ycgco" => M::NV_ENC_VUI_MATRIX_COEFFS_YCGCO,
-        "bt2020ncl" | "bt2020_ncl" | "2020ncl" => M::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL,
-        "bt2020cl" | "bt2020_cl" | "2020cl" => M::NV_ENC_VUI_MATRIX_COEFFS_BT2020_CL,
-        "smpte2085" => M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE2085,
+    Some(match cicp {
+        0 => M::NV_ENC_VUI_MATRIX_COEFFS_RGB,
+        1 => M::NV_ENC_VUI_MATRIX_COEFFS_BT709,
+        2 => M::NV_ENC_VUI_MATRIX_COEFFS_UNSPECIFIED,
+        4 => M::NV_ENC_VUI_MATRIX_COEFFS_FCC,
+        5 => M::NV_ENC_VUI_MATRIX_COEFFS_BT470BG,
+        6 => M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M,
+        7 => M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE240M,
+        8 => M::NV_ENC_VUI_MATRIX_COEFFS_YCGCO,
+        9 => M::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL,
+        10 => M::NV_ENC_VUI_MATRIX_COEFFS_BT2020_CL,
+        11 => M::NV_ENC_VUI_MATRIX_COEFFS_SMPTE2085,
         other => {
             tracing::warn!(
-                value = other,
-                "PUNKTFUNK_VUI_MATRIX: unrecognised matrix name — leaving the derived value"
+                cicp = other,
+                "PUNKTFUNK_VUI_MATRIX: no NVENC variant for this code point — leaving the derived value"
             );
             return None;
         }
@@ -710,23 +705,7 @@ fn parse_vui_matrix(raw: &str) -> Option<nv::NV_ENC_VUI_MATRIX_COEFFS> {
 /// not perform also picked a swing we did not choose, and a stream that computes full but declares
 /// limited gets expanded a second time by the decoder.
 fn vui_full_range_override() -> Option<u32> {
-    parse_vui_full_range(&std::env::var("PUNKTFUNK_VUI_FULL_RANGE").ok()?)
-}
-
-/// The value→flag mapping behind [`vui_full_range_override`]; split out for the same reason as
-/// [`parse_vui_matrix`].
-fn parse_vui_full_range(raw: &str) -> Option<u32> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "full" => Some(1),
-        "0" | "limited" | "studio" => Some(0),
-        other => {
-            tracing::warn!(
-                value = other,
-                "PUNKTFUNK_VUI_FULL_RANGE: expected 0/1 (limited/full) — leaving the derived value"
-            );
-            None
-        }
-    }
+    pf_host_config::vui_full_range_override().map(u32::from)
 }
 
 /// The per-session knobs both direct-NVENC backends feed [`apply_low_latency_config`]. `Copy` so the

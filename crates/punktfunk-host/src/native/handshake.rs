@@ -512,10 +512,25 @@ pub(super) async fn negotiate(
         // 10-bit capture format); 8-bit stays BT.709 SDR. The mastering metadata (ST.2086 +
         // CLL) rides the 0xCE datagram below. (A future step can refine this to the capturer's
         // actual monitor HDR state and announce a mid-stream flip.)
-        color: if bit_depth >= 10 {
-            ColorInfo::HDR10_BT2020_PQ
-        } else {
-            ColorInfo::SDR_BT709
+        //
+        // The `PUNKTFUNK_VUI_*` overrides apply here as well as to the bitstream VUI, and must:
+        // this field and that one describe the SAME conversion, and clients read one or the
+        // other. The webOS/LG client configures the panel from `ColorInfo.matrix`
+        // (`NDL_DirectVideoSetHDRInfo`) and never parses the VUI, so an override that moved only
+        // the VUI would leave that client — and its picture — exactly as it was.
+        color: {
+            let mut c = if bit_depth >= 10 {
+                ColorInfo::HDR10_BT2020_PQ
+            } else {
+                ColorInfo::SDR_BT709
+            };
+            if let Some(m) = pf_host_config::vui_matrix_override() {
+                c.matrix = m;
+            }
+            if let Some(fr) = pf_host_config::vui_full_range_override() {
+                c.full_range = fr;
+            }
+            c
         },
         // The chroma the encoder will actually emit (resolved + GPU-probed above) — 4:4:4 only
         // when every gate passed, else 4:2:0. The client sizes its decoder from this.

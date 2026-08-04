@@ -159,7 +159,7 @@ index 76b3ea8..6b56b01 100644
  	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
  
  //	for (auto& param : params)
-@@ -166,6 +209,14 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
+@@ -166,6 +209,21 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
  
  	build_format_params(builder, SPA_VIDEO_FORMAT_BGRx, params);
  	build_format_params(builder, SPA_VIDEO_FORMAT_NV12, params);
@@ -167,8 +167,15 @@ index 76b3ea8..6b56b01 100644
 +	// Listed LAST, on purpose: PipeWire intersects in offer order, so every consumer that
 +	// negotiates today's 8-bit stream keeps negotiating it bit-for-bit. Only a consumer that
 +	// asks for a 10-bit format by name — and accepts the MANDATORY BT.2020 + PQ colorimetry
-+	// above — ever reaches these.
-+	build_format_params(builder, SPA_VIDEO_FORMAT_xRGB_210LE, params);
++	// above — ever reaches this.
++	//
++	// xBGR ONLY, deliberately. The RGB-ordered twin was offered here too and is the one a
++	// consumer picks first, but the composite lands BGR-ordered regardless — NVIDIA exposes
++	// only XBGR2101010/ABGR2101010 for these (ValveSoftware/gamescope#1029), so the texture
++	// cannot come back the other way round. Offering it produced a negotiation that succeeds
++	// and transposes red and blue: a uniformly blue-shifted stream that no colour signalling
++	// can correct, since none of it moves a channel. Upstream's own take on this
++	// (ValveSoftware/gamescope#2270) offers xBGR alone for the same reason.
 +	build_format_params(builder, SPA_VIDEO_FORMAT_xBGR_210LE, params);
 +#endif
  

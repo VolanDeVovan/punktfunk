@@ -1360,13 +1360,30 @@ pub fn pipewire_thread(
     // SDR alongside would make the producer pick its earlier-listed SDR format, and the
     // negotiation-timeout path latches the process-wide SDR downgrade if nothing matches.
     let format_pods: Vec<Vec<u8>> = if want_hdr {
+        // The producer takes the first pod it can satisfy, so this order decides the channel
+        // order we then hand to the encoder. `PUNKTFUNK_HDR_RGB_ORDER=bgr` puts xBGR first.
+        //
+        // That knob is a swap TEST, not a preference: if a producer's 10-bit PQ buffers carry
+        // BGR while it accepts the xRGB pod, red and blue arrive transposed and the picture is
+        // uniformly blue-shifted — through every matrix, since no colour label can move a
+        // channel. Flipping the offer is the cheapest way to tell that apart from a signalling
+        // bug, which relabelling would have fixed.
+        let bgr_first = std::env::var("PUNKTFUNK_HDR_RGB_ORDER")
+            .map(|v| v.trim().eq_ignore_ascii_case("bgr"))
+            .unwrap_or(false);
+        let (first, second) = if bgr_first {
+            (VideoFormat::xBGR_210LE, VideoFormat::xRGB_210LE)
+        } else {
+            (VideoFormat::xRGB_210LE, VideoFormat::xBGR_210LE)
+        };
         tracing::info!(
+            bgr_first,
             "HDR capture: offering xRGB_210LE/xBGR_210LE LINEAR dmabufs with MANDATORY \
              BT.2020 + SMPTE-2084 (PQ) colorimetry (GNOME 50+ monitor stream)"
         );
         vec![
-            build_hdr_dmabuf_format(VideoFormat::xRGB_210LE, preferred)?,
-            build_hdr_dmabuf_format(VideoFormat::xBGR_210LE, preferred)?,
+            build_hdr_dmabuf_format(first, preferred)?,
+            build_hdr_dmabuf_format(second, preferred)?,
         ]
     } else if want_dmabuf {
         let mut pods = Vec::with_capacity(if prefer_native_nv12 { 2 } else { 1 });

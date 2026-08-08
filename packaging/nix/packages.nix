@@ -28,6 +28,8 @@
   craneLib,
   src,
   version,
+  # A store shell for the udev callout — see the 60-punktfunk.rules note in postInstall.
+  runtimeShell,
   # native tooling
   pkg-config,
   cmake,
@@ -169,6 +171,15 @@ in
 
         # udev: /dev/uinput + /dev/uhid (virtual gamepads) + the vhci sysfs perms for the virtual Deck.
         install -Dm0644 scripts/60-punktfunk.rules "$out/lib/udev/rules.d/60-punktfunk.rules"
+        # That file is written for the `sudo cp` install it documents, so its vhci line shells the
+        # chgrp/chmod out through a literal /bin/sh — which is exactly the one path a udev worker
+        # cannot resolve on NixOS. There /bin is an envfs fuse mount, and the worker's mount
+        # namespace predates it, so the rule only ever logs
+        #   vhci_hcd.0: Failed to find and pin callout binary "/bin/sh"
+        # and never runs: attach/detach keep their root-only default and the usbip virtual Deck
+        # cannot be attached by the user-level host service. Point the callout at a store shell.
+        substituteInPlace "$out/lib/udev/rules.d/60-punktfunk.rules" \
+          --replace-fail "/bin/sh" "${runtimeShell}"
 
         # KWin Desktop-mode authorization (zkde_screencast + fake_input). Point Exec at the store binary.
         install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \

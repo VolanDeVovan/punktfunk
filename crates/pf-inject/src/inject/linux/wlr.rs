@@ -6,6 +6,12 @@
 //! to evdev/US), and translate events into virtual pointer/keyboard requests, tracking modifier
 //! state so the compositor resolves shifted keysyms correctly.
 //!
+//! **Touch** has no protocol in this family at all — neither wlr-protocols nor the misc set has a
+//! virtual touchscreen — so wire touches leave Wayland and go in through a uinput device instead
+//! ([`crate::touchscreen`]). That device is mapped onto ONE output by the compositor, and unlike
+//! the pointer below there is nothing here to aim it with: the pin belongs in the compositor's own
+//! config (niri `input { touch { map-to-output "pf-N" } }`, sway `input <id> map_to_output pf-N`).
+//!
 //! **Absolute** motion is mapped by the compositor onto the `wl_output` the virtual pointer was
 //! CREATED with, so which output that is decides where every absolute sample lands. We aim it at
 //! the head the session is actually streaming — published by name in [`crate::stream_output`] and
@@ -201,6 +207,14 @@ pub struct WlrootsInjector {
     _keymap_file: std::fs::File, // keep the memfd alive for the compositor's mmap
     /// Dedicated committed-text device ([`InputKind::TextInput`]), created on first use.
     text: Option<TextKeyboard>,
+    /// The uinput multitouch screen the wire's touch plane lands on, created on the first finger
+    /// (a session that never touches never creates a device). Not a Wayland object: this protocol
+    /// family has no virtual-touch protocol at all — see [`crate::touchscreen`], and mind that the
+    /// compositor maps it onto ONE output, which its own config has to pin to the streamed head.
+    touch: Option<crate::touchscreen::VirtualTouchscreen>,
+    /// A failed touchscreen create is latched, so a host without `/dev/uinput` access warns once
+    /// and then costs a bool per finger instead of an `open` per finger.
+    touch_failed: bool,
     start: Instant,
 }
 
@@ -336,6 +350,8 @@ impl WlrootsInjector {
             xkb_state,
             _keymap_file: file,
             text: None,
+            touch: None,
+            touch_failed: false,
             start: Instant::now(),
         })
     }
@@ -569,8 +585,28 @@ impl InputInjector for WlrootsInjector {
             | InputKind::GamepadAxis
             | InputKind::GamepadRemove
             | InputKind::GamepadArrival => {} // not yet injected
-            // wlroots has no virtual-touch protocol wired here; touch is the libei path only.
-            InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {}
+            // Wire touch → the uinput multitouch screen. wlr-protocols has no virtual-TOUCH
+            // protocol to bind (pointer and keyboard are the whole set), so unlike every other
+            // kind here this one leaves Wayland entirely and goes in through libinput — which is
+            // also why its output mapping is the compositor's config rather than ours to set.
+            // Lazily created; a create failure latches back to the historical no-op.
+            InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {
+                if self.touch.is_none() && !self.touch_failed {
+                    match crate::touchscreen::VirtualTouchscreen::create() {
+                        Ok(t) => self.touch = Some(t),
+                        Err(e) => {
+                            self.touch_failed = true;
+                            tracing::warn!(
+                                error = %format!("{e:#}"),
+                                "touch: no virtual touchscreen — wire touch stays a no-op on this backend"
+                            );
+                        }
+                    }
+                }
+                if let Some(t) = self.touch.as_mut() {
+                    t.apply(event);
+                }
+            }
         }
         self.pump()
     }

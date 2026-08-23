@@ -685,6 +685,14 @@ pub mod pen;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/stream_target.rs"]
 pub mod stream_target;
+/// Linux: the "Punktfunk Touchscreen" uinput multitouch device — the wire-touch path for the
+/// injector backends that have no virtual-touch protocol to reach for. The wlroots family is the
+/// whole of that set (wlr-protocols ships a virtual pointer and a virtual keyboard and nothing
+/// else), so on niri/sway this is what makes touch passthrough land at all; the libei, KWin and
+/// Windows paths each have a real touch surface of their own.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/touchscreen.rs"]
+pub mod touchscreen;
 #[cfg(target_os = "windows")]
 pub use stream_target::set_stream_target;
 /// Linux: the streamed compositor output (by name) that absolute coordinates map into — the

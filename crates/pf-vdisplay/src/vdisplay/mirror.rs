@@ -117,6 +117,10 @@ impl VirtualDisplay for MirrorDisplay {
             Compositor::Hyprland => {
                 crate::hyprland::stream_existing_output(&target.connector, self.hw_cursor)?
             }
+            #[cfg(target_os = "linux")]
+            Compositor::Niri => {
+                crate::niri::stream_existing_output(&target.connector, self.hw_cursor)?
+            }
             // gamescope on the DRM backend (a Bazzite/SteamOS Game Mode session) DOES drive a real
             // head — `monitors::list` reports it, and mirroring it is an attach to the composited
             // node this session already publishes. A nested or headless gamescope reports no heads,
@@ -224,8 +228,11 @@ fn check_mirrorable(target: &monitors::PhysicalMonitor, compositor: Compositor) 
 fn names_ours_conclusively(compositor: Compositor) -> bool {
     match compositor {
         // Ours by construction: KWin outputs carry the `Virtual-punktfunk-<id>` name the identity
-        // module hands the backend, Hyprland's are `PF-N`. Nothing else mints those names.
-        Compositor::Kwin | Compositor::Hyprland => true,
+        // module hands the backend, Hyprland's are `PF-N`, niri's are `pf-N` AND carry the
+        // `niri`/`virtual` make+model niri stamps on every virtual output — the pair is what makes
+        // it proof rather than a hint, since the stamp alone would also claim a virtual output the
+        // USER declared with `create-virtual` in their niri config. Nothing else mints those names.
+        Compositor::Kwin | Compositor::Hyprland | Compositor::Niri => true,
         // Sway names EVERY headless output `HEADLESS-N`, its own included; Mutter's virtual monitors
         // carry no distinguishing name at all (it won't take one from us); and gamescope's
         // `list_monitors` only ever reports the real DRM head a Game Mode session drives, so

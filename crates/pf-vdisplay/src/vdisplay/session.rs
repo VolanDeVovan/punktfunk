@@ -175,6 +175,7 @@ fn is_desktop_kind(kind: ActiveKind) -> bool {
             | ActiveKind::DesktopGnome
             | ActiveKind::DesktopWlroots
             | ActiveKind::DesktopHyprland
+            | ActiveKind::DesktopNiri
     )
 }
 
@@ -195,6 +196,10 @@ pub enum ActiveKind {
     /// A Hyprland desktop is live (distinct from [`DesktopWlroots`](ActiveKind::DesktopWlroots):
     /// its own `hyprctl` IPC + xdph portal, though it shares the wlr virtual-input path).
     DesktopHyprland,
+    /// A niri desktop is live. Like Hyprland it has its own IPC (`niri msg`) and its own capture
+    /// dialect (niri's built-in `org.gnome.Mutter.ScreenCast`), while sharing the wlr
+    /// virtual-input path.
+    DesktopNiri,
     /// No recognized graphical session is running for our uid.
     None,
 }
@@ -228,6 +233,10 @@ pub struct SessionEnv {
     /// PID like the Hyprland signature above. `None` on river (wlroots, but no sway IPC) and every
     /// other compositor.
     pub sway_socket: Option<String>,
+    /// `NIRI_SOCKET` of the live niri instance (`Some` only for [`ActiveKind::DesktopNiri`]).
+    /// `niri msg` needs it, and `niri::is_available()` keys off it — same role, and same
+    /// systemd-`--user`-host reason, as [`sway_socket`](SessionEnv::sway_socket).
+    pub niri_socket: Option<String>,
 }
 
 /// The live session: its [`ActiveKind`] plus the [`SessionEnv`] to target it.
@@ -267,6 +276,7 @@ pub fn compositor_for_kind(kind: ActiveKind) -> Option<Compositor> {
         ActiveKind::DesktopGnome => Some(Compositor::Mutter),
         ActiveKind::DesktopWlroots => Some(Compositor::Wlroots),
         ActiveKind::DesktopHyprland => Some(Compositor::Hyprland),
+        ActiveKind::DesktopNiri => Some(Compositor::Niri),
         ActiveKind::None => None,
     }
 }
@@ -292,6 +302,7 @@ struct EnvProbe {
     wayland_display: Option<String>,
     hyprland_signature: Option<String>,
     swaysock: Option<String>,
+    niri_socket: Option<String>,
 }
 
 impl EnvProbe {
@@ -307,6 +318,7 @@ impl EnvProbe {
             wayland_display: v("WAYLAND_DISPLAY"),
             hyprland_signature: v("HYPRLAND_INSTANCE_SIGNATURE"),
             swaysock: v("SWAYSOCK"),
+            niri_socket: v("NIRI_SOCKET"),
         })
     }
 }
@@ -397,6 +409,14 @@ pub fn detect_active_session() -> ActiveSession {
                 // wlroots-proper family (design/hyprland-support.md D1).
                 "Hyprland" | "hyprland" => (ActiveKind::DesktopHyprland, 4),
                 "sway" | "river" => (ActiveKind::DesktopWlroots, 4),
+                // `niri msg` — the IPC CLIENT — reports `comm == "niri"` too, and running one
+                // permanently (`niri msg event-stream` feeding a status bar or a layout script) is
+                // ordinary. Counting it as a compositor would not just add a phantom: the winner's
+                // pid is what `observe_session_instance` diffs across polls, so a client that
+                // outlived a compositor restart could masquerade as the session and suppress the
+                // epoch bump that invalidates the dead instance's kept displays. The compositor is
+                // the invocation with no subcommand — argv[1] absent or a flag (`--session`, `-c`).
+                "niri" if is_niri_compositor(&pid_path) => (ActiveKind::DesktopNiri, 4),
                 _ => continue,
             };
             let pid = name.parse::<u32>().ok();
@@ -423,9 +443,10 @@ pub fn detect_active_session() -> ActiveSession {
     // virtual pointer/keyboard client connects to it); Gaming-attach and Mutter are node/D-Bus
     // driven and don't.
     let wayland_display = match kind {
-        ActiveKind::DesktopKde | ActiveKind::DesktopWlroots | ActiveKind::DesktopHyprland => {
-            find_wayland_socket(&env, &xdg_runtime_dir, uid)
-        }
+        ActiveKind::DesktopKde
+        | ActiveKind::DesktopWlroots
+        | ActiveKind::DesktopHyprland
+        | ActiveKind::DesktopNiri => find_wayland_socket(&env, &xdg_runtime_dir, uid),
         _ => None,
     };
     let xdg_current_desktop = match kind {
@@ -435,6 +456,8 @@ pub fn detect_active_session() -> ActiveSession {
         // G4: advertise the real desktop so portal routing (portals.conf `[Hyprland]`) and xdph's
         // own Hyprland checks work — NOT the old blanket `sway`.
         ActiveKind::DesktopHyprland => Some("Hyprland".to_string()),
+        // What niri itself sets, and what its own D-Bus/portal integration is keyed to.
+        ActiveKind::DesktopNiri => Some("niri".to_string()),
         ActiveKind::Gaming => Some("gamescope".to_string()),
         ActiveKind::None => None,
     };
@@ -450,6 +473,11 @@ pub fn detect_active_session() -> ActiveSession {
         ActiveKind::DesktopWlroots => find_sway_socket(&env, &xdg_runtime_dir, uid, winning_pid),
         _ => None,
     };
+    // niri's IPC socket, same idea again: without it `niri msg` has nothing to talk to.
+    let niri_socket = match kind {
+        ActiveKind::DesktopNiri => find_niri_socket(&env, &xdg_runtime_dir, uid, winning_pid),
+        _ => None,
+    };
     ActiveSession {
         kind,
         env: SessionEnv {
@@ -459,6 +487,7 @@ pub fn detect_active_session() -> ActiveSession {
             xdg_current_desktop,
             hyprland_signature,
             sway_socket,
+            niri_socket,
         },
         compositor_pid: winning_pid,
     }
@@ -531,6 +560,73 @@ fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -
         }
         let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
         cands.push((mtime, e.path().to_string_lossy().into_owned()));
+    }
+    cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
+    cands.into_iter().next().map(|(_, p)| p)
+}
+
+/// Is the `niri`-named process at `pid_path` the COMPOSITOR rather than an IPC client?
+///
+/// `niri msg …` shares the binary and therefore `comm`, so the detection scan needs a second look
+/// to tell them apart (see its call site for why a false positive is worse than a missed one). The
+/// rule reads argv[1]: the compositor takes no subcommand, only flags (`niri`, `niri --session`,
+/// `niri -c <path>`), while every client form leads with one (`msg`, `validate`, `completions`,
+/// `panic`). An unreadable `cmdline` (a process exiting under us, or one we may not read) answers
+/// "not the compositor" — the scan would otherwise adopt a pid it knows nothing about.
+#[cfg(target_os = "linux")]
+fn is_niri_compositor(pid_path: &std::path::Path) -> bool {
+    match std::fs::read(pid_path.join("cmdline")) {
+        Ok(raw) => argv_is_niri_compositor(&raw),
+        Err(_) => false,
+    }
+}
+
+/// The rule [`is_niri_compositor`] applies, over a raw `/proc/<pid>/cmdline` (NUL-separated argv).
+/// Split out so it is a pure function of its input and the cases can be tested without a `/proc`.
+#[cfg(target_os = "linux")]
+fn argv_is_niri_compositor(raw: &[u8]) -> bool {
+    match raw.split(|b| *b == 0).filter(|a| !a.is_empty()).nth(1) {
+        // Bare `niri` — the compositor with no arguments at all.
+        None => true,
+        // A flag (`--session`, `-c <path>`) is still the compositor; a bare word is a subcommand.
+        Some(arg) => arg.first() == Some(&b'-'),
+    }
+}
+
+/// Find the live niri IPC socket (`NIRI_SOCKET`) for our uid. Trust a valid inherited value first,
+/// then the socket the detected compositor pid owns, then the newest-mtime `niri.*.sock` we own —
+/// the same ladder as [`find_sway_socket`].
+///
+/// niri names it `niri.<wayland-display>.<pid>.sock`, so the exact match keys on the `.<pid>.sock`
+/// suffix rather than rebuilding the whole name: the wayland display in the middle is the
+/// compositor's, which is not necessarily the one this process resolved.
+#[cfg(target_os = "linux")]
+fn find_niri_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if let Some(s) = &env.niri_socket {
+        if std::path::Path::new(s).exists() {
+            return Some(s.clone());
+        }
+    }
+    let exact_suffix = pid.map(|p| format!(".{p}.sock"));
+    let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for e in std::fs::read_dir(runtime).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("niri.") || !name.ends_with(".sock") {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        if md.uid() != uid {
+            continue;
+        }
+        let path = e.path().to_string_lossy().into_owned();
+        if let Some(suffix) = &exact_suffix {
+            if name.ends_with(suffix.as_str()) {
+                return Some(path);
+            }
+        }
+        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+        cands.push((mtime, path));
     }
     cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
     cands.into_iter().next().map(|(_, p)| p)
@@ -615,6 +711,14 @@ pub fn apply_session_env(active: &ActiveSession) {
         match &e.sway_socket {
             Some(sock) => std::env::set_var("SWAYSOCK", sock),
             None => std::env::remove_var("SWAYSOCK"),
+        }
+        // niri: same treatment once more. `niri::is_available()` keys off this variable, so
+        // setting it here is what makes the backend visible at all to a host that never inherited
+        // the session env; clearing it stops a niri→gamescope switch leaving `niri msg` aimed at a
+        // dead socket.
+        match &e.niri_socket {
+            Some(sock) => std::env::set_var("NIRI_SOCKET", sock),
+            None => std::env::remove_var("NIRI_SOCKET"),
         }
         // NOTHING live ⇒ every session-scoped var still in the env is a leftover from a previous
         // connect's retarget, and the availability probes read them: after a gnome-shell crash
@@ -844,6 +948,32 @@ mod instance_change_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn niri_compositor_is_told_apart_from_its_ipc_client() {
+        let argv = |parts: &[&str]| parts.join("\0").into_bytes();
+        // The compositor: bare, or with flags only.
+        assert!(argv_is_niri_compositor(&argv(&["niri"])));
+        assert!(argv_is_niri_compositor(&argv(&["niri", "--session"])));
+        assert!(argv_is_niri_compositor(&argv(&[
+            "niri",
+            "-c",
+            "/etc/niri/config.kdl"
+        ])));
+        // Clients — all of them lead with a subcommand. `msg event-stream` is the one that runs
+        // forever, which is what makes this worth checking rather than assuming.
+        assert!(!argv_is_niri_compositor(&argv(&["niri", "msg"])));
+        assert!(!argv_is_niri_compositor(&argv(&[
+            "niri",
+            "msg",
+            "-j",
+            "event-stream"
+        ])));
+        assert!(!argv_is_niri_compositor(&argv(&["niri", "validate"])));
+        // A trailing NUL (how the kernel actually terminates the list) changes nothing.
+        assert!(!argv_is_niri_compositor(b"niri\0msg\0"));
+        assert!(argv_is_niri_compositor(b"niri\0"));
+    }
 
     /// A scratch runtime dir with the sway-ipc sockets named in `pids`, plus the uid the names are
     /// built from. Removed on drop.

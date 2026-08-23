@@ -130,6 +130,8 @@ pub fn list(compositor: Compositor) -> Result<Vec<PhysicalMonitor>> {
         Compositor::Wlroots => crate::wlroots::list_monitors(),
         #[cfg(target_os = "linux")]
         Compositor::Hyprland => crate::hyprland::list_monitors(),
+        #[cfg(target_os = "linux")]
+        Compositor::Niri => crate::niri::list_monitors(),
         // gamescope is only *sometimes* nested. A Bazzite/SteamOS Game Mode session is the DRM
         // master and drives a real connector; the ones this crate spawns are headless and drive
         // none. `gamescope::list_monitors` tells those apart and answers an empty list — not an

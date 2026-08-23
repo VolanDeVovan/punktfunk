@@ -8,6 +8,9 @@
 //! * **KWin** — privileged `zkde_screencast_unstable_v1::stream_virtual_output` ([`kwin`]).
 //! * **wlroots/Sway** — `swaymsg create_output` + `output mode --custom` ([`wlroots`]).
 //! * **Mutter/GNOME** — D-Bus `RemoteDesktop` + `ScreenCast.RecordVirtual` ([`mutter`]).
+//! * **niri** — `niri msg create-virtual-output` + niri's own Mutter `ScreenCast`
+//!   ([`niri`]). Like Hyprland its own backend, not a wlroots dialect: its own IPC and its
+//!   own capture dialect, sharing only the wlr virtual-input path.
 //! * **Hyprland** — `hyprctl output create headless` + the xdg-desktop-portal-hyprland ScreenCast
 //!   portal. Its own backend, not a wlroots dialect (`design/hyprland-support.md` D1).
 //! * **gamescope** — three sub-modes behind one backend ([`GamescopeRoute`]): bare
@@ -132,6 +135,10 @@ pub enum Compositor {
     /// virtual-input path yet needs its own IPC (`hyprctl`) and portal (xdph) — see
     /// `design/hyprland-support.md`.
     Hyprland,
+    /// niri — `niri msg create-virtual-output` + niri's built-in `org.gnome.Mutter.ScreenCast`.
+    /// Same shape as [`Hyprland`](Compositor::Hyprland): its own IPC and its own capture dialect,
+    /// while sharing the wlr virtual-input path. Needs a niri built with niri-wm/niri#3800.
+    Niri,
 }
 
 impl Compositor {
@@ -144,6 +151,7 @@ impl Compositor {
             Compositor::Mutter => "mutter",
             Compositor::Gamescope => "gamescope",
             Compositor::Hyprland => "hyprland",
+            Compositor::Niri => "niri",
         }
     }
 
@@ -171,6 +179,7 @@ impl Compositor {
             Compositor::Mutter => "Mutter / GNOME",
             Compositor::Gamescope => "gamescope",
             Compositor::Hyprland => "Hyprland",
+            Compositor::Niri => "niri",
         }
     }
 
@@ -186,6 +195,11 @@ impl Compositor {
             // A client asking for `wlroots`/`hyprland` gets whichever of the two is the live session
             // (`pick_compositor` (host `native`) resolves the family).
             Compositor::Hyprland => P::Wlroots,
+            // Same reasoning as Hyprland: no distinct wire byte. niri shares the wlr virtual-input
+            // path, and `pick_compositor` resolves the family to whichever member is live — so a
+            // client that predates this backend still reaches it, and none of the clients need a
+            // protocol bump to pick a niri host.
+            Compositor::Niri => P::Wlroots,
         }
     }
 
@@ -202,13 +216,14 @@ impl Compositor {
     }
 
     /// Every backend, in a stable display order (for enumeration / UIs).
-    pub fn all() -> [Compositor; 5] {
+    pub fn all() -> [Compositor; 6] {
         [
             Compositor::Kwin,
             Compositor::Gamescope,
             Compositor::Mutter,
             Compositor::Wlroots,
             Compositor::Hyprland,
+            Compositor::Niri,
         ]
     }
 }
@@ -262,6 +277,7 @@ pub fn available() -> Vec<Compositor> {
                         Compositor::Mutter => mutter::is_available(),
                         Compositor::Wlroots => wlroots::is_available(),
                         Compositor::Hyprland => hyprland::is_available(),
+                        Compositor::Niri => niri::is_available(),
                     }
             })
             .collect()
@@ -283,6 +299,7 @@ fn compositor_from_pin(v: &str) -> Option<Compositor> {
         "wlroots" | "sway" | "wlr" | "river" => Compositor::Wlroots,
         "mutter" | "gnome" => Compositor::Mutter,
         "gamescope" => Compositor::Gamescope,
+        "niri" => Compositor::Niri,
         _ => return None,
     })
 }
@@ -499,6 +516,7 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
             Compositor::Mutter => Ok(Box::new(mutter::MutterDisplay::new()?)),
             Compositor::Wlroots => Ok(Box::new(wlroots::WlrootsDisplay::new()?)),
             Compositor::Hyprland => Ok(Box::new(hyprland::HyprlandDisplay::new()?)),
+            Compositor::Niri => Ok(Box::new(niri::NiriDisplay::new()?)),
         }
     }
     #[cfg(target_os = "windows")]
@@ -558,8 +576,10 @@ pub fn probe(compositor: Compositor) -> Result<()> {
             // error instead of a create-time failure), plus the permission-system warning.
             Compositor::Hyprland => hyprland::probe(),
             // gamescope spawns its own nested session per `create`; Mutter is D-Bus on demand;
-            // wlroots creates the output on demand — nothing to pre-check beyond "Linux".
-            Compositor::Gamescope | Compositor::Mutter | Compositor::Wlroots => Ok(()),
+            // wlroots and niri create the output on demand — nothing to pre-check beyond "Linux".
+            Compositor::Gamescope | Compositor::Mutter | Compositor::Wlroots | Compositor::Niri => {
+                Ok(())
+            }
         }
     }
     #[cfg(target_os = "windows")]
@@ -890,6 +910,10 @@ mod ddc;
 #[path = "vdisplay/linux/mutter.rs"]
 mod mutter;
 
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/niri.rs"]
+mod niri;
+
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/windows/pf_vdisplay.rs"]
 pub mod driver;
@@ -991,6 +1015,10 @@ mod tests {
         assert_eq!(
             compositor_for_kind(ActiveKind::DesktopHyprland),
             Some(Compositor::Hyprland)
+        );
+        assert_eq!(
+            compositor_for_kind(ActiveKind::DesktopNiri),
+            Some(Compositor::Niri)
         );
         // No live session → no backend; the caller turns this into a handshake error / fallback.
         assert_eq!(compositor_for_kind(ActiveKind::None), None);

@@ -165,7 +165,11 @@ pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) -> Option<Gam
         Compositor::Mutter => "libei",
         // Hyprland kept `zwlr_virtual_pointer_v1` + `zwp_virtual_keyboard_v1` (D4) — same wlr
         // injector as sway/river, no code change.
-        Compositor::Wlroots | Compositor::Hyprland => "wlr",
+        // niri implements `zwlr_virtual_pointer_manager_v1` (v2, so the per-output
+        // `create_virtual_pointer_with_output` anchor is available) and
+        // `zwp_virtual_keyboard_manager_v1` — the same injector as sway/river/Hyprland, no code
+        // change. Verified against niri 26.04 with `wayland-info`.
+        Compositor::Wlroots | Compositor::Hyprland | Compositor::Niri => "wlr",
     };
     // SAFETY: `_env_guard` holds [`ENV_LOCK`] — the crate-wide discipline (lib.rs) serializing
     // every process-env writer on the session-setup path; steady-state threads read cached
@@ -309,11 +313,18 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
             wlroots::focus_output(name);
             true
         }
+        // niri is the third EXTEND backend: its virtual output sits beside the operator's heads,
+        // so it needs the same focus assertion (`niri msg action focus-monitor`).
+        Compositor::Niri if niri::is_managed_output(name) => {
+            niri::focus_output(name);
+            true
+        }
         // Exhaustive on purpose (no `_` arm): a backend added later must come here and decide,
         // rather than inheriting "no focus" silently — the failure mode is invisible in a log and
         // only shows up as a game on the wrong screen.
         Compositor::Hyprland
         | Compositor::Wlroots
+        | Compositor::Niri
         | Compositor::Kwin
         | Compositor::Mutter
         | Compositor::Gamescope => false,

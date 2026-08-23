@@ -18,13 +18,18 @@ fn pick_compositor(
     use crate::vdisplay::Compositor;
     match Compositor::from_pref(pref) {
         Some(want) if available.contains(&want) => Some(want),
-        // `CompositorPref::Wlroots` names the wlroots *family* (D2): sway/river ([`Wlroots`]) and
-        // Hyprland are distinct backends but mutually-exclusive live sessions, so honor the request
-        // with whichever family member is actually available — the detected one if it's a family
-        // member, else the first available of the two.
+        // `CompositorPref::Wlroots` names the wlroots *family* (D2): sway/river ([`Wlroots`]),
+        // Hyprland and niri are distinct backends but mutually-exclusive live sessions, so honor
+        // the request with whichever family member is actually available — the detected one if it's
+        // a family member, else the first available of the three.
+        //
+        // niri joins the family for the same reason Hyprland did: it shares the wlr virtual-input
+        // path and carries no wire byte of its own, so `Compositor::as_pref` maps it here. Without
+        // this arm a client asking for `wlroots` on a niri box still landed on niri, but only
+        // through the `.or(detected)` fallback below — i.e. by accident rather than by the rule.
         Some(Compositor::Wlroots) => match detected {
-            Some(d @ (Compositor::Wlroots | Compositor::Hyprland)) => Some(d),
-            _ => [Compositor::Wlroots, Compositor::Hyprland]
+            Some(d @ (Compositor::Wlroots | Compositor::Hyprland | Compositor::Niri)) => Some(d),
+            _ => [Compositor::Wlroots, Compositor::Hyprland, Compositor::Niri]
                 .into_iter()
                 .find(|c| available.contains(c))
                 .or(detected),
@@ -312,6 +317,17 @@ mod tests {
         assert_eq!(
             pick_compositor(CompositorPref::Wlroots, &[Hyprland], Some(Hyprland)),
             Some(Hyprland)
+        );
+        // …and to niri on a niri host, which carries no wire byte of its own either.
+        assert_eq!(
+            pick_compositor(CompositorPref::Wlroots, &[Niri], Some(Niri)),
+            Some(Niri)
+        );
+        // Family resolution, not the `.or(detected)` fallback: niri is available but something
+        // outside the family was detected, so the request still lands on the family member.
+        assert_eq!(
+            pick_compositor(CompositorPref::Wlroots, &[Niri, Kwin], Some(Kwin)),
+            Some(Niri)
         );
         // …and to Wlroots-proper on a sway/river host.
         assert_eq!(

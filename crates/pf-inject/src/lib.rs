@@ -186,7 +186,7 @@ pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
 pub fn default_backend() -> Backend {
     if let Ok(v) = std::env::var("PUNKTFUNK_INPUT_BACKEND") {
         match v.trim().to_ascii_lowercase().as_str() {
-            "wlr" | "wlroots" | "wlrvirtual" => return Backend::WlrVirtual,
+            "wlr" | "wlroots" | "wlrvirtual" | "niri" => return Backend::WlrVirtual,
             "kwin" | "fakeinput" | "fake_input" | "kwin-fake-input" => {
                 return Backend::KwinFakeInput
             }
@@ -213,6 +213,11 @@ pub fn default_backend() -> Backend {
             // Hyprland kept the wlr virtual-input protocols, so it injects through the same
             // backend as sway/river (design/hyprland-support.md D4).
             || c.eq_ignore_ascii_case("hyprland")
+            // niri implements them too (`zwlr_virtual_pointer_manager_v1` v2 +
+            // `zwp_virtual_keyboard_manager_v1`), so it shares the injector as well. Named
+            // explicitly rather than left to the XDG sniff below, which lands on the same answer
+            // only because WlrVirtual is its fallback.
+            || c.eq_ignore_ascii_case("niri")
         {
             return Backend::WlrVirtual;
         }

@@ -348,6 +348,128 @@ pub fn open_virtual_mic(_channels: u32) -> Result<Box<dyn VirtualMic>> {
     anyhow::bail!("virtual mic requires Linux + PipeWire or Windows + a virtual audio device")
 }
 
+/// `PUNKTFUNK_SILENT_CLIENTS`: devices whose sessions carry **no audio plane at all** — the host
+/// never starts the encode thread, so not one Opus datagram is sent to them. Returns the rule that
+/// matched, for the log line that has to explain a silent client.
+///
+/// **Why the host has this knob, and why it is the wrong place for it.** A client that is a second
+/// MONITOR rather than a speaker — the tablet propped next to the desk — has no use for the
+/// desktop's audio, which is already playing on the desk it is sitting on. Today nothing anywhere
+/// can turn that off: the host starts the plane for every virtual session, [`crate::native`]'s
+/// `Hello` cannot say "no audio" ([`punktfunk_core::audio::normalize_channels`] has no zero), and
+/// the Apple/Android clients only mute the MIC. So the choice is expressed here, on the host, keyed
+/// on the device's identity.
+///
+/// **The right home is the client**, as a per-device toggle beside its speaker picker (the wire
+/// change is small — a `Hello` bit, or `audio_channels = 0` meaning "none", which the host would
+/// answer by skipping exactly this thread). It belongs there because it is a property of what the
+/// device is FOR, the user changes it where they are looking, and it needs no host restart. This
+/// env list is the host-only stand-in until a client ships that toggle: an operator can silence a
+/// device without rebuilding an app for the platform it runs on.
+///
+/// Grammar: comma-separated (device names have spaces in them — "Steam Deck" — so commas are the
+/// only separator). A rule matches the device's operator-facing name case-insensitively, or a
+/// prefix of its certificate fingerprint of at least [`FP_RULE_MIN`] hex characters (for two
+/// devices that share a name); `*` matches every client.
+///
+/// `name` is a closure because resolving one means reading the trust store, and the answer is
+/// almost always "there are no rules": every session on every host would pay for a lookup that
+/// nothing then reads.
+pub fn silent_client(name: impl FnOnce() -> String, fingerprint: Option<&str>) -> Option<String> {
+    let list = std::env::var("PUNKTFUNK_SILENT_CLIENTS").ok()?;
+    silence_rule(&list, &name(), fingerprint)
+}
+
+/// Shortest fingerprint prefix a rule may be. A SHA-256 hex prefix this long is already unique
+/// among a household's devices, while a shorter one is far likelier to be a typo'd device name
+/// that would silence a client nobody meant to silence.
+const FP_RULE_MIN: usize = 8;
+
+/// [`silent_client`] without the environment, so the grammar is testable.
+fn silence_rule(list: &str, name: &str, fingerprint: Option<&str>) -> Option<String> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .find(|rule| {
+            *rule == "*"
+                || rule.eq_ignore_ascii_case(name.trim())
+                || (rule.len() >= FP_RULE_MIN
+                    && fingerprint.is_some_and(|fp| {
+                        fp.len() >= rule.len() && fp[..rule.len()].eq_ignore_ascii_case(rule)
+                    }))
+        })
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FP: &str = "825f27a44147c426c33ef1d87466e8b9bc299c30093a0a2905e6733c32710e60";
+
+    /// The everyday form: the name the operator sees in the console, spelled however they spell it.
+    #[test]
+    fn a_rule_matches_the_device_name_case_insensitively() {
+        assert_eq!(
+            silence_rule("ipad", "ipad", Some(FP)).as_deref(),
+            Some("ipad")
+        );
+        assert_eq!(silence_rule("iPad", "ipad", None).as_deref(), Some("iPad"));
+        assert_eq!(
+            silence_rule("  ipad  ", "ipad", None).as_deref(),
+            Some("ipad")
+        );
+        assert!(silence_rule("ipad", "TV", Some(FP)).is_none());
+    }
+
+    /// Commas alone separate: a device name may contain spaces, and splitting on those would make
+    /// "Steam Deck" two rules that match nothing.
+    #[test]
+    fn only_commas_separate_rules() {
+        let list = "TV, Steam Deck ,ipad";
+        assert_eq!(
+            silence_rule(list, "Steam Deck", None).as_deref(),
+            Some("Steam Deck")
+        );
+        assert_eq!(silence_rule(list, "ipad", None).as_deref(), Some("ipad"));
+        assert!(silence_rule(list, "Deck", None).is_none());
+    }
+
+    /// A fingerprint prefix is the tie-breaker for same-named devices — but only when it is long
+    /// enough to be one, so a short mistyped name cannot silence a client by accident.
+    #[test]
+    fn a_long_enough_fingerprint_prefix_matches() {
+        assert_eq!(
+            silence_rule("825f27a4", "ipad", Some(FP)).as_deref(),
+            Some("825f27a4")
+        );
+        assert_eq!(silence_rule(FP, "ipad", Some(FP)).as_deref(), Some(FP));
+        // Case-insensitive, like every other hex the store prints.
+        assert!(silence_rule("825F27A4", "ipad", Some(FP)).is_some());
+        // Too short to be a fingerprint rule — and not the device's name either.
+        assert!(silence_rule("825f", "ipad", Some(FP)).is_none());
+        // A rule longer than the fingerprint cannot be a prefix of it.
+        assert!(silence_rule("825f27a44147", "ipad", Some("825f27a4")).is_none());
+        assert!(silence_rule("825f27a4", "ipad", None).is_none());
+    }
+
+    /// `*` is the "this host is not a speaker" switch — every client, no exceptions.
+    #[test]
+    fn a_star_silences_every_client() {
+        assert_eq!(silence_rule("*", "anything", None).as_deref(), Some("*"));
+    }
+
+    /// An empty or blank list silences nobody: unset, `""`, and a stray trailing comma all mean
+    /// "no rules", never "match everything".
+    #[test]
+    fn an_empty_list_silences_nobody() {
+        assert!(silence_rule("", "ipad", Some(FP)).is_none());
+        assert!(silence_rule("  ", "ipad", Some(FP)).is_none());
+        assert!(silence_rule(",,", "ipad", Some(FP)).is_none());
+        assert!(silence_rule("", "", None).is_none());
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[path = "audio/windows/audio_control.rs"]
 mod audio_control;

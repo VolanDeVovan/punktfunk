@@ -303,6 +303,23 @@ fn run_ephemeral(opts: Punktfunk1Options) -> Result<()> {
     rt.block_on(serve(opts, 0, np, stats, ident))
 }
 
+/// A session device's operator-facing name: the trust store's curated name for this fingerprint (a
+/// rename at approval wins over what the device calls itself), else the sanitized `Hello` name —
+/// sanitized because an unpaired device's is untrusted wire text, and a fingerprint-derived label
+/// when it is empty.
+///
+/// One function because two callers must agree on it: the lifecycle events the console renders, and
+/// the audio-silence rules an operator writes against exactly what the console showed them.
+fn device_label(np: &NativePairing, fp_hex: &str, hello_name: Option<&str>) -> String {
+    np.list()
+        .into_iter()
+        .find(|c| c.fingerprint == fp_hex)
+        .map(|c| c.name)
+        .unwrap_or_else(|| {
+            crate::native_pairing::sanitize_device_name(hello_name.unwrap_or(""), fp_hex)
+        })
+}
+
 fn fingerprint_hex(fp: &[u8; 32]) -> String {
     fp.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1609,17 +1626,7 @@ async fn serve_session(
             // The lifecycle events' device identity: the trust store's operator-curated name for
             // this fingerprint (a rename at approval wins), else the sanitized Hello name.
             let device = crate::events::DeviceRef {
-                name: np
-                    .list()
-                    .into_iter()
-                    .find(|c| c.fingerprint == fp_hex)
-                    .map(|c| c.name)
-                    .unwrap_or_else(|| {
-                        crate::native_pairing::sanitize_device_name(
-                            hello.name.as_deref().unwrap_or(""),
-                            &fp_hex,
-                        )
-                    }),
+                name: device_label(np, &fp_hex, hello.name.as_deref()),
                 fingerprint: fp_hex,
                 plane: crate::events::Plane::Native,
             };
@@ -1848,11 +1855,32 @@ async fn serve_session(
         )
     };
 
+    // Devices the operator has declared silent (`PUNKTFUNK_SILENT_CLIENTS` — a tablet used as a
+    // second MONITOR, sitting next to the speakers already playing the same desktop). Resolved
+    // before the plane starts rather than muted inside it: the point is that nothing is captured,
+    // encoded or sent for this session at all. See `crate::audio::silent_client` for why the knob
+    // is here and why the client is where it really belongs.
+    let silenced = crate::audio::silent_client(
+        || {
+            device_label(
+                np,
+                session_fp_hex.as_deref().unwrap_or(""),
+                hello.name.as_deref(),
+            )
+        },
+        session_fp_hex.as_deref(),
+    );
+    if let Some(rule) = &silenced {
+        tracing::info!(
+            rule = %rule,
+            "audio plane OFF for this client (PUNKTFUNK_SILENT_CLIENTS) — no capture, no datagrams"
+        );
+    }
     // Audio plane (virtual source only — synthetic runs are protocol tests): desktop Opus
     // → host→client QUIC datagrams, on its own native thread. Best-effort on every failure
     // (no PipeWire audio, spawn error): the session continues without audio — and a spawn
     // error must NOT early-return here, the threads above are already running.
-    let audio_handle = if opts.source == Punktfunk1Source::Virtual {
+    let audio_handle = if opts.source == Punktfunk1Source::Virtual && silenced.is_none() {
         let conn = conn.clone();
         let stop = stop.clone();
         let cap = audio_cap.clone();

@@ -51,9 +51,9 @@ use ashpd::zbus;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use zbus::zvariant::{OwnedObjectPath, Value};
@@ -70,10 +70,10 @@ const CURSOR_METADATA: u32 = 2;
 /// wedge the session thread forever (see [`crate::proc`]).
 const MSG_BUDGET: Duration = Duration::from_secs(5);
 
-/// Names our virtual outputs `pf-1`, `pf-2`, … — process-wide so two concurrent sessions cannot
-/// collide on a name. niri rejects a create whose name is already taken, so a collision would be a
-/// hard failure rather than a silent share; this makes it not arise.
-static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Serializes "read the taken names, then take one" ([`lowest_free_name`] + the create it feeds).
+/// Two sessions starting together would otherwise both see no `pf-1` and both ask for it, and niri
+/// rejects a create whose name is already taken — a failed session in place of a collision.
+static PICK: Mutex<()> = Mutex::new(());
 
 /// The niri virtual-display driver. Stateless — each [`create`](VirtualDisplay::create) adds one
 /// virtual output and spins up a D-Bus thread owning the cast on it.
@@ -109,11 +109,14 @@ impl VirtualDisplay for NiriDisplay {
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        let requested = format!("pf-{}", OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed) + 1);
-
         // niri fixes the mode at creation — there is no follow-up `mode --custom` to get wrong, and
         // the refresh rate doubles as the output's frame clock. `--refresh-rate` is whole Hz.
-        let created = create_virtual_output(&requested, mode)?;
+        let created = {
+            // Dropped before `record` below: the lock covers the pick and its create, not the
+            // seconds of D-Bus that follow.
+            let _pick = PICK.lock().unwrap_or_else(|e| e.into_inner());
+            create_virtual_output(&lowest_free_name(), mode)?
+        };
         // Own it from here on, so any error below unwinds into a remove instead of leaking an
         // output into the user's layout.
         let output = OutputGuard(created);
@@ -178,6 +181,49 @@ impl Drop for OutputGuard {
             }
         }
     }
+}
+
+/// `pf-<n>` for the lowest `n` niri does not already have an output under.
+///
+/// **Why the lowest free index and not a counter.** The streamed head's connector name is the only
+/// handle a compositor CONFIG has on it, and touch is what forces the point: the wire's fingers
+/// reach niri through a uinput touchscreen (`pf_inject::touchscreen` — this protocol family has no
+/// virtual-touch protocol to bind), niri maps a touch device onto ONE output by name
+/// (`input { touch { map-to-output … } }`, no per-device rules, no "the output being streamed"),
+/// and it has no event to notice a new one. A per-process counter would rename the head every
+/// session, so any such pin would be correct exactly once per boot. Reusing the lowest free index
+/// instead makes the ordinary case — one client at a time, which is every real setup — always
+/// `pf-1`, while a second CONCURRENT session still gets a name of its own.
+fn lowest_free_name() -> String {
+    format!("pf-{}", lowest_free(&taken_pf_indices()))
+}
+
+/// The `pf-N` indices niri currently has outputs under: ours, plus anything a crashed host left
+/// behind (its outputs outlive it, and so do their names).
+///
+/// An unreadable output list yields an empty set rather than an error — the create that follows is
+/// the honest report of an IPC that is not answering, and a blind `pf-1` is no worse a guess there
+/// than a blind `pf-99`.
+fn taken_pf_indices() -> Vec<u64> {
+    let Ok(outputs) = niri_msg_json(&["outputs"]) else {
+        return Vec::new();
+    };
+    outputs
+        .as_object()
+        .map(|m| m.keys().filter_map(|k| pf_index(k)).collect())
+        .unwrap_or_default()
+}
+
+/// `"pf-3"` → `Some(3)`. Anything else — a physical connector, niri's own `HEADLESS-1`, an
+/// operator's `create-virtual` output, or a `pf-`-looking name with no number — is not one of ours
+/// and does not reserve an index.
+fn pf_index(connector: &str) -> Option<u64> {
+    connector.strip_prefix("pf-")?.parse().ok()
+}
+
+/// The lowest `n >= 1` that `taken` does not contain.
+fn lowest_free(taken: &[u64]) -> u64 {
+    (1..).find(|n| !taken.contains(n)).expect("1.. is infinite")
 }
 
 /// `niri msg -j create-virtual-output …` → the name niri actually assigned.
@@ -527,5 +573,33 @@ mod tests {
         // An operator's `create-virtual` output, and a physical head.
         assert!(!is_managed_output("ipad"));
         assert!(!is_managed_output("DP-2"));
+    }
+
+    /// Only a `pf-<number>` reserves an index. A name that merely starts with `pf-` is somebody
+    /// else's — counting it would push every session one index along and defeat the stability the
+    /// whole scheme exists for.
+    #[test]
+    fn only_numbered_pf_names_reserve_an_index() {
+        assert_eq!(pf_index("pf-1"), Some(1));
+        assert_eq!(pf_index("pf-12"), Some(12));
+        assert_eq!(pf_index("pf-"), None);
+        assert_eq!(pf_index("pf-ipad"), None);
+        assert_eq!(pf_index("pf--1"), None);
+        assert_eq!(pf_index("HEADLESS-1"), None);
+        assert_eq!(pf_index("DP-2"), None);
+    }
+
+    /// The point of the whole scheme: with nothing of ours live, the next session is `pf-1` again
+    /// — the name a compositor config (niri's touch `map-to-output`) can be written against. A
+    /// concurrent session still gets its own, and a gap left by an earlier teardown is filled
+    /// rather than skipped.
+    #[test]
+    fn the_lowest_free_index_is_reused() {
+        assert_eq!(lowest_free(&[]), 1);
+        assert_eq!(lowest_free(&[1]), 2);
+        assert_eq!(lowest_free(&[1, 2]), 3);
+        assert_eq!(lowest_free(&[2, 3]), 1);
+        // Order is not sortedness — the taken set comes off a JSON object's keys.
+        assert_eq!(lowest_free(&[3, 1]), 2);
     }
 }
